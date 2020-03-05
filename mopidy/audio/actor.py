@@ -12,6 +12,8 @@ from mopidy.audio.listener import AudioListener
 from mopidy.internal import process
 from mopidy.internal.gi import GLib, GObject, Gst, GstPbutils
 
+from hashlib import sha256 as filename_hash
+
 logger = logging.getLogger(__name__)
 
 # This logger is only meant for debug logging of low level GStreamer info such
@@ -413,6 +415,8 @@ class _Handler:
         AudioListener.send("position_changed", position=position_ms)
 
 
+
+
 # TODO: create a player class which replaces the actors internals
 class Audio(pykka.ThreadingActor):
 
@@ -425,6 +429,8 @@ class Audio(pykka.ThreadingActor):
 
     #: The software mixing interface :class:`mopidy.audio.actor.SoftwareMixer`
     mixer = None
+
+    _output_file = None
 
     def __init__(self, config, mixer):
         super().__init__()
@@ -446,6 +452,8 @@ class Audio(pykka.ThreadingActor):
         self._handler = _Handler(self)
         self._appsrc = _Appsrc()
         self._signals = utils.Signals()
+
+        self._current_name = None
 
         if mixer and self._config["audio"]["mixer"] == "software":
             self.mixer = pykka.traversable(SoftwareMixer(mixer))
@@ -496,11 +504,29 @@ class Audio(pykka.ThreadingActor):
         self._signals.disconnect(self._playbin, "source-setup")
         self._playbin.set_state(Gst.State.NULL)
 
+    def on_new_buffer(self, appsink):
+        sample = appsink.emit("pull-sample")
+        if sample:
+            buf = sample.get_buffer()
+            if Audio._output_file:
+                data = buf.extract_dup(0, buf.get_size())
+                Audio._output_file.write(data)
+            else:
+                print("new buffer (%d)" % buf.get_size())
+            return Gst.FlowReturn.OK
+        return Gst.FlowReturn.ERROR
+
     def _setup_outputs(self):
         # We don't want to use outputs for regular testing, so just install
         # an unsynced fakesink when someone asks for a 'testoutput'.
         if self._config["audio"]["output"] == "testoutput":
             self._outputs = Gst.ElementFactory.make("fakesink")
+        elif self._config["audio"]["output"] == "appsink":
+            appsink = Gst.ElementFactory.make("appsink", "sink")
+            appsink.set_property('emit-signals', True) 
+            appsink.set_property('sync', False) 
+            appsink.connect('new-sample', Audio.on_new_buffer)
+            self._outputs = appsink
         else:
             self._outputs = _Outputs()
             try:
@@ -553,6 +579,8 @@ class Audio(pykka.ThreadingActor):
             )
             return
 
+        print("on about to finish##")
+        self.stop_recording()
         gst_logger.debug("Got about-to-finish event.")
         if self._about_to_finish_callback:
             logger.debug("Running about-to-finish callback.")
@@ -586,7 +614,7 @@ class Audio(pykka.ThreadingActor):
             and discarding data when paused
         :type live_stream: bool
         """
-
+        print("set_uri: " + str(uri))
         # XXX: Hack to workaround issue on Mac OS X where volume level
         # does not persist between track changes. mopidy/mopidy#886
         if self.mixer is not None:
@@ -710,6 +738,7 @@ class Audio(pykka.ThreadingActor):
 
         :rtype: :class:`True` if successfull, else :class:`False`
         """
+        print("pause!!")
         return self._set_state(Gst.State.PAUSED)
 
     def prepare_change(self):
@@ -774,6 +803,7 @@ class Audio(pykka.ThreadingActor):
         """
         if state < Gst.State.PAUSED:
             self._buffering = False
+            self.stop_recording()
 
         self._target_state = state
         result = self._playbin.set_state(state)
@@ -781,6 +811,15 @@ class Audio(pykka.ThreadingActor):
             "Changing state to %s: result=%s",
             state.value_name,
             result.value_name,
+        )
+        if state == Gst.State.READY:
+            self._current_name = None
+        print(
+            "Changing state to %s: result=%s" %
+            (
+                state.value_name,
+                result.value_name
+            )
         )
 
         if result == Gst.StateChangeReturn.FAILURE:
@@ -791,6 +830,17 @@ class Audio(pykka.ThreadingActor):
         # TODO: at this point we could already emit stopped event instead
         # of faking it in the message handling when result=OK
         return True
+
+    def stop_recording(self):
+        if Audio._output_file:
+            Audio._output_file.close()
+            Audio._output_file = None
+            if self._current_name:
+                import subprocess
+                subprocess.run("sox -r 44100 -b 32 -e signed -c 1 -t raw '%s' '%s.mp3' && rm -f '%s'" % (
+                    self._current_name, self._current_name, self._current_name), shell=True
+                    )
+        self._current_name = ""
 
     # TODO: bake this into setup appsrc perhaps?
     def set_metadata(self, track):
@@ -820,6 +870,8 @@ class Audio(pykka.ThreadingActor):
         set_value(Gst.TAG_TITLE, " ")
         set_value(Gst.TAG_ALBUM, " ")
 
+        self.stop_recording()
+
         if artists:
             set_value(Gst.TAG_ARTIST, ", ".join([a.name for a in artists]))
 
@@ -829,9 +881,16 @@ class Audio(pykka.ThreadingActor):
         if track.album and track.album.name:
             set_value(Gst.TAG_ALBUM, track.album.name)
 
+        dirname = "/mnt/c/Temp/"
+        if not os.path.exists(dirname):
+            os.makedirs(dirname)
+        self._current_name = dirname + "/" + filename_hash(track.uri.encode()).hexdigest()
+        Audio._output_file = open(self._current_name, "wb")
+
         gst_logger.debug(
             "Sending TAG event for track %r: %r", track.uri, taglist.to_string()
         )
+
         event = Gst.Event.new_tag(taglist)
         if self._pending_uri:
             self._pending_metadata = event
