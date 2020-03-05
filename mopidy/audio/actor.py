@@ -13,6 +13,8 @@ from mopidy.internal import process
 from mopidy.internal.gi import GLib, GObject, Gst, GstPbutils
 
 from hashlib import sha256 as filename_hash
+import re
+import subprocess
 
 logger = logging.getLogger(__name__)
 
@@ -430,8 +432,6 @@ class Audio(pykka.ThreadingActor):
     #: The software mixing interface :class:`mopidy.audio.actor.SoftwareMixer`
     mixer = None
 
-    _output_file = None
-
     def __init__(self, config, mixer):
         super().__init__()
 
@@ -508,29 +508,49 @@ class Audio(pykka.ThreadingActor):
         sample = appsink.emit("pull-sample")
         if sample:
             buf = sample.get_buffer()
-            if Audio._output_file:
+            if self._output_file:
                 data = buf.extract_dup(0, buf.get_size())
-                Audio._output_file.write(data)
+                self._output_file.write(data)
             else:
-                print("new buffer (%d)" % buf.get_size())
+                logger.debug("new buffer (%d)" % buf.get_size())
             return Gst.FlowReturn.OK
         return Gst.FlowReturn.ERROR
 
     def _setup_outputs(self):
         # We don't want to use outputs for regular testing, so just install
         # an unsynced fakesink when someone asks for a 'testoutput'.
-        if self._config["audio"]["output"] == "testoutput":
+        audio_output = self._config["audio"]["output"]
+        if audio_output == "testoutput":
             self._outputs = Gst.ElementFactory.make("fakesink")
-        elif self._config["audio"]["output"] == "appsink":
-            appsink = Gst.ElementFactory.make("appsink", "sink")
-            appsink.set_property('emit-signals', True) 
-            appsink.set_property('sync', False) 
-            appsink.connect('new-sample', Audio.on_new_buffer)
-            self._outputs = appsink
+        elif audio_output.startswith("file") \
+                and "location" in audio_output:
+
+            def get_value(value_name, config):
+                match = re.search(r"%s=\"([^\"]*)\"" % value_name, config)
+                if not match:
+                    match = re.search(r"%s=(\S*)" % value_name, config)
+                if match:
+                    return match.group(1)
+                return None
+
+            self._file_output_location = get_value("location", audio_output)
+            self._file_processing = get_value("processing", audio_output)
+            if self._file_output_location:
+                if not os.path.exists(self._file_output_location):
+                    os.makedirs(self._file_output_location)
+
+                appsink = Gst.ElementFactory.make("appsink", "sink")
+                appsink.set_property('emit-signals', True) 
+                appsink.set_property('sync', False) 
+                appsink.connect('new-sample', Audio.on_new_buffer)
+                self._outputs = appsink
+            else:
+                logger.error("no location for audio output file")
+                process.exit_process()
         else:
             self._outputs = _Outputs()
             try:
-                self._outputs.add_output(self._config["audio"]["output"])
+                self._outputs.add_output(audio_output)
             except exceptions.AudioException:
                 process.exit_process()  # TODO: move this up the chain
 
@@ -813,14 +833,8 @@ class Audio(pykka.ThreadingActor):
             result.value_name,
         )
         if state == Gst.State.READY:
+            logger.info("clearing current output filename")
             self._current_name = None
-        print(
-            "Changing state to %s: result=%s" %
-            (
-                state.value_name,
-                result.value_name
-            )
-        )
 
         if result == Gst.StateChangeReturn.FAILURE:
             logger.warning(
@@ -832,13 +846,13 @@ class Audio(pykka.ThreadingActor):
         return True
 
     def stop_recording(self):
-        if Audio._output_file:
-            Audio._output_file.close()
-            Audio._output_file = None
-            if self._current_name:
-                import subprocess
-                subprocess.run("sox -r 44100 -b 32 -e signed -c 1 -t raw '%s' '%s.mp3' && rm -f '%s'" % (
-                    self._current_name, self._current_name, self._current_name), shell=True
+        if "_output_file" in self.__dict__ and self._output_file:
+            self._output_file.close()
+            self._output_file = None
+            if self._current_name and self._file_processing:
+                #subprocess.run("sox -r 44100 -b 32 -e signed -c 1 -t raw '{raw}' '{raw}.mp3' && rm -f '{raw}'"
+                subprocess.run(self._file_processing
+                        .format(raw=self._current_name), shell=True
                     )
         self._current_name = ""
 
@@ -881,11 +895,10 @@ class Audio(pykka.ThreadingActor):
         if track.album and track.album.name:
             set_value(Gst.TAG_ALBUM, track.album.name)
 
-        dirname = "/mnt/c/Temp/"
-        if not os.path.exists(dirname):
-            os.makedirs(dirname)
-        self._current_name = dirname + "/" + filename_hash(track.uri.encode()).hexdigest()
-        Audio._output_file = open(self._current_name, "wb")
+        if "_file_output_location" in self.__dict__\
+                and self._file_output_location:
+            self._current_name = os.path.join(self._file_output_location, filename_hash(track.uri.encode()).hexdigest())
+            self._output_file = open(self._current_name, "wb")
 
         gst_logger.debug(
             "Sending TAG event for track %r: %r", track.uri, taglist.to_string()
